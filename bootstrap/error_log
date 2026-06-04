@@ -1,8 +1,0 @@
-[05-Feb-2026 15:31:12 UTC] PHP Fatal error:  Uncaught Error: Class "Illuminate\Foundation\Application" not found in /home3/kodomote/public_html/gruma/bootstrap/app.php:7
-Stack trace:
-#0 {main}
-  thrown in /home3/kodomote/public_html/gruma/bootstrap/app.php on line 7
-[06-Feb-2026 01:36:44 UTC] PHP Fatal error:  Uncaught Error: Class "Illuminate\Foundation\Application" not found in /home3/kodomote/public_html/gruma/bootstrap/app.php:7
-Stack trace:
-#0 {main}
-  thrown in /home3/kodomote/public_html/gruma/bootstrap/app.php on line 7
