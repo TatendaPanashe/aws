@@ -6,12 +6,14 @@ use App\Models\CourierSale;
 use App\Models\FaceValue;
 use App\Models\User;
 use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 
 class CourierSaleController extends Controller
 {
     private const COURIER_SBU = 'SBU3';
+    private const COURIER_PLATFORM = 'Courier Connect';
     private const INSURANCE_PROVIDERS = ['Nicoz Diamond', 'Champions'];
     private const SUPPORTED_CURRENCIES = ['USD', 'ZWG'];
 
@@ -30,22 +32,80 @@ class CourierSaleController extends Controller
 
         abort_unless($isCourierClerk || $isCourierSupervisor || $isGlobalViewer, 403);
 
+        return $this->renderReport($request, [
+            'isCourierClerk' => $isCourierClerk,
+            'isCourierSupervisor' => $isCourierSupervisor,
+            'isGlobalViewer' => $isGlobalViewer,
+            'scope' => $isCourierClerk
+                ? ['clerk_id' => $user->id]
+                : ($isCourierSupervisor ? ['clerk_ids' => $this->getCourierClerkIds()] : []),
+            'routeName' => 'courier.sales.index',
+        ]);
+    }
+
+    public function superuser(Request $request)
+    {
+        abort_unless((int) Auth::user()->role_id === 5, 403);
+
+        return $this->renderReport($request, [
+            'isCourierClerk' => false,
+            'isCourierSupervisor' => false,
+            'isGlobalViewer' => true,
+            'scope' => [],
+            'routeName' => 'courier.sales.superuser',
+        ]);
+    }
+
+    public function supervisor(Request $request)
+    {
+        abort_unless((int) Auth::user()->role_id === 3, 403);
+
+        return $this->renderReport($request, [
+            'isCourierClerk' => false,
+            'isCourierSupervisor' => true,
+            'isGlobalViewer' => false,
+            'scope' => [],
+            'routeName' => 'courier.sales.supervisor',
+        ]);
+    }
+
+    private function renderReport(Request $request, array $options)
+    {
+        $isCourierClerk = (bool) ($options['isCourierClerk'] ?? false);
+        $isCourierSupervisor = (bool) ($options['isCourierSupervisor'] ?? false);
+        $isGlobalViewer = (bool) ($options['isGlobalViewer'] ?? false);
+        $scope = $options['scope'] ?? [];
+        $routeName = $options['routeName'] ?? 'courier.sales.index';
+
         $selectedDate = $request->filled('sale_date')
             ? Carbon::parse($request->input('sale_date'))->toDateString()
             : Carbon::today()->toDateString();
         $selectedProvider = $request->input('insurance_provider');
         $selectedClerkId = $request->input('clerk_id');
 
-        $batches = $isCourierClerk ? $this->getCourierBatchesForClerk($user->id) : collect();
+        $batches = !empty($scope['clerk_id']) ? $this->getCourierBatchesForClerk($scope['clerk_id']) : collect();
 
         $query = CourierSale::with(['clerk.site', 'clerk.network', 'faceValue'])
+            ->select('courier_sales.*')
+            ->selectSub(function ($usageQuery) {
+                $usageQuery->from('face_values')
+                    ->selectRaw('COALESCE(SUM(used), 0)')
+                    ->whereColumn('face_values.clerk_id', 'courier_sales.clerk_id')
+                    ->whereColumn('face_values.batch_id', 'courier_sales.batch_id')
+                    ->where('face_values.is_parent', false)
+                    ->whereRaw('DATE(face_values.created_at) = courier_sales.sale_date')
+                    ->where(function ($providerQuery) {
+                        $providerQuery->whereColumn('face_values.insurance_provider', 'courier_sales.insurance_provider')
+                            ->orWhereNull('face_values.insurance_provider');
+                    });
+            }, 'face_values_used')
             ->orderByDesc('sale_date')
             ->orderByDesc('created_at');
 
-        if ($isCourierClerk) {
-            $query->where('clerk_id', $user->id);
-        } elseif ($isCourierSupervisor) {
-            $query->whereIn('clerk_id', $this->getCourierClerkIds());
+        if (!empty($scope['clerk_id'])) {
+            $query->where('clerk_id', $scope['clerk_id']);
+        } elseif (!empty($scope['clerk_ids'])) {
+            $query->whereIn('clerk_id', $scope['clerk_ids']);
         }
 
         if ($request->filled('sale_date')) {
@@ -61,6 +121,7 @@ class CourierSaleController extends Controller
         }
 
         $sales = $query->get();
+        $faceValuesUsedTotal = $this->getFaceValuesUsedTotal($sales);
 
         $summaryCards = [
             [
@@ -87,13 +148,16 @@ class CourierSaleController extends Controller
                 'note' => 'Insurers represented in the selected Courier sales.',
                 'icon' => 'bi bi-building-check',
             ],
+            [
+                'label' => 'Face Values Used',
+                'value' => number_format($faceValuesUsedTotal),
+                'note' => 'Declared face values used for the selected Courier sales.',
+                'icon' => 'bi bi-receipt-cutoff',
+            ],
         ];
 
         $clerks = ($isCourierSupervisor || $isGlobalViewer)
-            ? User::with('site')
-                ->whereIn('id', $this->getCourierClerkIds())
-                ->orderBy('name')
-                ->get()
+            ? $this->getClerksForSalesReport($scope)
             : collect();
 
         return view('courier-sales.index', [
@@ -108,6 +172,7 @@ class CourierSaleController extends Controller
             'summaryCards' => $summaryCards,
             'isCourierClerk' => $isCourierClerk,
             'isCourierSupervisor' => $isCourierSupervisor,
+            'reportRouteName' => $routeName,
         ]);
     }
 
@@ -187,14 +252,9 @@ class CourierSaleController extends Controller
 
     private function getCourierClerkIds(): array
     {
-        return User::where('role_id', 7)
-            ->where(function ($query) {
-                $query->whereHas('site', function ($siteQuery) {
-                    $siteQuery->where('sbu', self::COURIER_SBU);
-                });
-                $query->orWhereHas('network', function ($networkQuery) {
-                    $networkQuery->where('name', self::COURIER_SBU);
-                });
+        return User::whereIn('role_id', [2, 7])
+            ->whereHas('site', function ($siteQuery) {
+                $siteQuery->whereRaw('UPPER(TRIM(platform_name)) = ?', [strtoupper(self::COURIER_PLATFORM)]);
             })
             ->pluck('id')
             ->toArray();
@@ -211,5 +271,36 @@ class CourierSaleController extends Controller
             ->map(fn ($rows) => $rows->sortByDesc('created_at')->first())
             ->sortByDesc('created_at')
             ->values();
+    }
+
+    private function getClerksForSalesReport(array $scope)
+    {
+        $query = User::with('site')->orderBy('name');
+
+        if (!empty($scope['clerk_ids'])) {
+            $query->whereIn('id', $scope['clerk_ids']);
+        } else {
+            $query->whereIn('id', CourierSale::query()
+                ->select('clerk_id')
+                ->whereNotNull('clerk_id')
+                ->distinct());
+        }
+
+        return $query->get();
+    }
+
+    private function getFaceValuesUsedTotal(Collection $sales): int
+    {
+        return (int) $sales
+            ->filter(fn (CourierSale $sale) => $sale->clerk_id && $sale->batch_id && $sale->sale_date)
+            ->unique(function (CourierSale $sale) {
+                return implode('|', [
+                    $sale->clerk_id,
+                    $sale->batch_id,
+                    optional($sale->sale_date)->toDateString(),
+                    $sale->insurance_provider,
+                ]);
+            })
+            ->sum(fn (CourierSale $sale) => (float) $sale->face_values_used);
     }
 }

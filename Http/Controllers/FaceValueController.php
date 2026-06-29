@@ -17,10 +17,21 @@ use Illuminate\Support\Facades\DB;
 
 class FaceValueController extends Controller
 {
+    private const COURIER_PLATFORM = 'Courier Connect';
 
     public function __construct()
     {
         $this->middleware('auth');
+    }
+
+    private function getCourierConnectReportClerkIds(): array
+    {
+        return User::whereIn('role_id', [2, 7])
+            ->whereHas('site', function ($query) {
+                $query->whereRaw('UPPER(TRIM(platform_name)) = ?', [strtoupper(self::COURIER_PLATFORM)]);
+            })
+            ->pluck('id')
+            ->toArray();
     }
     
     /**
@@ -29,13 +40,13 @@ class FaceValueController extends Controller
     private function isSBU3User()
     {
         $user = Auth::user();
-        
-        if($user->site && $user->site->network) {
-            return $user->site->network->name === 'SBU3';
+
+        if ((int) $user->role_id === 6) {
+            return true;
         }
         
-        if($user->network) {
-            return $user->network->name === 'SBU3';
+        if($user->site && $user->site->sbu) {
+            return strtoupper(preg_replace('/\s+/', '', $user->site->sbu)) === 'SBU3';
         }
         
         return false;
@@ -47,6 +58,10 @@ class FaceValueController extends Controller
     private function getUserSBU()
     {
         $user = Auth::user();
+
+        if ((int) $user->role_id === 6) {
+            return 'SBU3';
+        }
         
         if($user->site && $user->site->sbu) {
             return $user->site->sbu;
@@ -62,7 +77,8 @@ class FaceValueController extends Controller
     private function getZinaraPlatform()
     {
         $user = Auth::user();
-        $user->site->platform_name; 
+
+        return site::whereKey($user->siteid)->value('platform_name');
     }
     
     /**
@@ -141,44 +157,28 @@ private function resolveFaceValueReportSbu(Request $request): ?string
      */
     private function calculateEndingRange(string $startingRange, int $quantity): string
     {
-        if (strlen($startingRange) < 2) {
+        $serial = $this->parseFaceValueSerial($startingRange);
+
+        if (!$serial || $quantity <= 0) {
             return $startingRange;
         }
-        
-        // Remove the last character (check digit)
-        $baseSerial = substr($startingRange, 0, -1);
-        $checkDigit = substr($startingRange, -1);
-        
-        // Extract prefix (letters) and numeric part
-        $prefix = '';
-        $numericPart = '';
-        
-        for ($i = 0; $i < strlen($baseSerial); $i++) {
-            if (is_numeric($baseSerial[$i])) {
-                $numericPart = substr($baseSerial, $i);
-                $prefix = substr($baseSerial, 0, $i);
-                break;
-            }
+
+        $endingNumeric = $this->addToNumericString($serial['numeric'], $quantity - 1);
+
+        return $this->formatFaceValueSerial($endingNumeric, $serial['prefix'], $serial['suffix'], $serial['width']);
+    }
+
+    private function calculateNextStartingRange(string $startingRange, int $quantity): string
+    {
+        $serial = $this->parseFaceValueSerial($startingRange);
+
+        if (!$serial || $quantity <= 0) {
+            return $startingRange;
         }
-        
-        // If no prefix found, treat entire string as numeric (except check digit)
-        if ($numericPart === '') {
-            $numericPart = $baseSerial;
-            $prefix = '';
-        }
-        
-        // Calculate new numeric value
-        $numericValue = (int) $numericPart;
-        $newNumericValue = $numericValue + $quantity - 1;
-        
-        // Preserve the same number of digits (pad with leading zeros)
-        $newNumericPadded = str_pad((string) $newNumericValue, strlen($numericPart), '0', STR_PAD_LEFT);
-        
-        // Build ending range (without check digit first, then add original check digit)
-        $endingBase = $prefix . $newNumericPadded;
-        $endingRange = $endingBase . $checkDigit;
-        
-        return $endingRange;
+
+        $nextNumeric = $this->addToNumericString($serial['numeric'], $quantity);
+
+        return $this->formatFaceValueSerial($nextNumeric, $serial['prefix'], $serial['suffix'], $serial['width']);
     }
     
     /**
@@ -709,6 +709,28 @@ private function hasGlobalFaceValueReportAccess(int $roleId): bool
 {
     return in_array($roleId, [1, 5], true);
 }
+
+private function activeDeclarationBatchForClerk(int $clerkId): ?FaceValue
+{
+    $activeBatchId = FaceValue::where('clerk_id', $clerkId)
+        ->where('is_parent', true)
+        ->where('batch_balance', '>', 0)
+        ->orderBy('created_at')
+        ->orderBy('id')
+        ->value('batch_id');
+
+    if (!$activeBatchId) {
+        return null;
+    }
+
+    return FaceValue::where('clerk_id', $clerkId)
+        ->where('is_parent', true)
+        ->where('batch_balance', '>', 0)
+        ->where('batch_id', $activeBatchId)
+        ->orderByDesc('created_at')
+        ->orderByDesc('id')
+        ->first();
+}
     
     /**
  * Build clerk serial trace
@@ -1088,7 +1110,22 @@ private function buildClerkSerialTrace(array $serialMeta, ?string $rangeStart, ?
                     }
                 });
             }
-        } elseif (in_array($roleId, [3, 6], true)) {
+        } elseif ($roleId === 6) {
+            $authorizedClerkIds = $this->getCourierConnectReportClerkIds();
+
+            if (!empty($authorizedClerkIds)) {
+                $query->where(function($q) use ($authorizedClerkIds, $user) {
+                    $q->whereIn('assigned_to', $authorizedClerkIds)
+                        ->orWhere(function ($parentQuery) use ($user) {
+                            $parentQuery->where('user_id', $user->id)
+                                ->whereNull('assigned_to');
+                        });
+                });
+            } else {
+                $query->where('user_id', $user->id)
+                    ->whereNull('assigned_to');
+            }
+        } elseif ($roleId === 3) {
             $authorizedClerkIds = $this->getAuthorizedClerkIdsForReport($sbu);
             
             if (!empty($authorizedClerkIds)) {
@@ -1132,9 +1169,11 @@ private function buildClerkSerialTrace(array $serialMeta, ?string $rangeStart, ?
         $clerkId = Auth::id();
         $roleId = (int) Auth::user()->role_id;
         
-        // For supervisors, we need to show history for their clerks or themselves
-        if ($roleId === 3) {
-            $authorizedClerkIds = $this->getAuthorizedClerkIds();
+        // For supervisors, show history for the clerks in their reporting scope.
+        if (in_array($roleId, [3, 6], true)) {
+            $authorizedClerkIds = $roleId === 6
+                ? $this->getCourierConnectReportClerkIds()
+                : $this->getAuthorizedClerkIds();
             
             if ($request->has(['startdate', 'enddate'])) {
                 $startdate = Carbon::parse($request->startdate);
@@ -1486,7 +1525,8 @@ private function buildClerkSerialTrace(array $serialMeta, ?string $rangeStart, ?
     $roleId = (int) Auth::user()->role_id;
 
     if ($roleId === 6) { // ZINARA Supervisor
-        $query->where('supervisor_id', Auth::id());
+        $authorizedClerkIds = $this->getCourierConnectReportClerkIds();
+        $query->whereIn('clerk_id', !empty($authorizedClerkIds) ? $authorizedClerkIds : [-1]);
     } elseif ($roleId === 7) { // ZINARA Clerk
         $query->where('clerk_id', Auth::id());
     } elseif ($roleId === 2) { // Regular Clerk
@@ -1514,42 +1554,15 @@ private function buildClerkSerialTrace(array $serialMeta, ?string $rangeStart, ?
     $roleId = (int) $user->role_id;
     $effectiveSbu = $sbu;
     
-    if ($roleId == 6) { // ZINARA Supervisor
-        $effectiveSbu = $this->getUserSBU();
-
-        if (!$effectiveSbu) {
-            return [];
-        }
-
-        return User::where('role_id', 7)
-            ->where(function($query) use ($effectiveSbu) {
-                $query->whereHas('network', function($q) use ($effectiveSbu) {
-                    $q->where('name', $effectiveSbu);
-                });
-                $query->orWhereHas('site', function($q) use ($effectiveSbu) {
-                    $q->where('sbu', $effectiveSbu);
-                });
-            })
-            ->pluck('id')
-            ->toArray();
+    if ($roleId == 6) { // Courier Supervisor
+        return $this->getCourierConnectReportClerkIds();
     } elseif ($roleId == 7) { // ZINARA Clerk
         return [$user->id];
     } elseif ($roleId == 3) { // Regular Supervisor
         if ($this->isSBU3User()) {
-            $effectiveSbu = $this->getUserSBU();
-
-            if (!$effectiveSbu) {
-                return [];
-            }
-
             return User::whereIn('role_id', [2, 7])
-                ->where(function($query) use ($effectiveSbu) {
-                    $query->whereHas('network', function($q) use ($effectiveSbu) {
-                        $q->where('name', $effectiveSbu);
-                    });
-                    $query->orWhereHas('site', function($q) use ($effectiveSbu) {
-                        $q->where('sbu', $effectiveSbu);
-                    });
+                ->whereHas('site', function($q) {
+                    $q->whereRaw('UPPER(REPLACE(sbu, ?, ?)) = ?', [' ', '', 'SBU3']);
                 })
                 ->pluck('id')
                 ->toArray();
@@ -1660,12 +1673,16 @@ private function displayUserName($user): string
     private function getScopedClerks()
     {
         $query = User::with(['site', 'network'])
-            ->where('role_id', 2)
+            ->whereIn('role_id', [2, 7])
             ->orderBy('name');
 
         $roleId = (int) Auth::user()->role_id;
 
-        if ($roleId === 3) {
+        if ($roleId === 6) {
+            $authorizedClerkIds = $this->getCourierConnectReportClerkIds();
+
+            $query->whereIn('id', !empty($authorizedClerkIds) ? $authorizedClerkIds : [-1]);
+        } elseif ($roleId === 3) {
             $authorizedClerkIds = $this->getAuthorizedClerkIds();
             
             if (!empty($authorizedClerkIds)) {
@@ -1821,7 +1838,8 @@ public function facevaluelist()
         $facevaluelist = FaceValue::where('clerk_id', Auth::id())
             ->where('is_parent', true)
             ->where('batch_balance', '>', 0)
-            ->orderByDesc('created_at')
+            ->orderBy('created_at')
+            ->orderBy('id')
             ->get();
     } else {
         // For supervisors - get their clerks' face values
@@ -1829,7 +1847,8 @@ public function facevaluelist()
         $facevaluelist = FaceValue::whereIn('clerk_id', $authorizedClerkIds)
             ->where('is_parent', true)
             ->where('batch_balance', '>', 0)
-            ->orderByDesc('created_at')
+            ->orderBy('created_at')
+            ->orderBy('id')
             ->get();
     }
 
@@ -1837,8 +1856,13 @@ public function facevaluelist()
     $facevaluelist = $facevaluelist
         ->groupBy('batch_id')
         ->map(fn ($rows) => $rows->sortByDesc('created_at')->first())
-        ->sortByDesc('created_at')
+        ->sortBy('created_at')
         ->values();
+
+    $activeDeclarationBatchId = null;
+    if ($roleId == 7 || $roleId == 2) {
+        $activeDeclarationBatchId = optional($this->activeDeclarationBatchForClerk(Auth::id()))->id;
+    }
     
     $batchinfo = [];
     foreach($facevaluelist as $faceValue){
@@ -1861,7 +1885,7 @@ public function facevaluelist()
         })
         ->get();
 
-    return view('facevalues.submitlist', compact('facevaluelist', 'used', 'batchinfo'));
+    return view('facevalues.submitlist', compact('facevaluelist', 'used', 'batchinfo', 'activeDeclarationBatchId'));
 }
 
 public function declare(Request $request)
@@ -1910,12 +1934,26 @@ public function declare(Request $request)
         return redirect()->route('facevaluelist')->with('error', 'The selected face value batch could not be found.');
     }
 
+    $activeDeclarationBatch = $this->activeDeclarationBatchForClerk(Auth::id());
+    if ($activeDeclarationBatch && (int) $activeDeclarationBatch->id !== (int) $clerktrans->id) {
+        return redirect()->route('facevaluelist')
+            ->with('error', 'You must deplete batch #' . $activeDeclarationBatch->batch_id . ' before declaring from another active batch.');
+    }
+
     $availableBalance = (int) $clerktrans->batch_balance;
 
     if($totalusednn > $availableBalance){
         return redirect()->route('facevaluelist')->with('error', 'Your declared face values exceed the available batch balance, please enter a correct amount and continue.');
     }
 
+    $previousDeclaredTotal = (int) FaceValue::where('parent_id', $clerktrans->id)
+        ->where('is_parent', false)
+        ->selectRaw('COALESCE(SUM(used), 0) + COALESCE(SUM(spoiled), 0) as declared_total')
+        ->value('declared_total');
+    $declarationStarting = $previousDeclaredTotal > 0
+        ? $this->calculateNextStartingRange($clerktrans->starting, $previousDeclaredTotal)
+        : $clerktrans->starting;
+    $declarationEnding = $this->calculateEndingRange($declarationStarting, $totalusednn);
     $clerkbalance = $availableBalance - (int) $request->input('used') - (int) $request->input('spoiled');
 
     $clerktrans->update([
@@ -1923,8 +1961,8 @@ public function declare(Request $request)
     ]);
 
     FaceValue::create([
-        'starting' => $request->input('starting'),
-        'ending' => $request->input('ending'),
+        'starting' => $declarationStarting,
+        'ending' => $declarationEnding,
         'received' => 0,
         'used' => $request->input('used'),
         'closing_balance' => $clerkbalance,
@@ -1940,7 +1978,9 @@ public function declare(Request $request)
         'document_channel' => ((int) Auth::user()->role_id === 7) ? 'Courier Connect' : 'Standard',
         'siteid' => Auth::user()->siteid,
         'networkid' => Auth::user()->networkid,
-        'platform_name' => Auth::user()->site->platform_name ?? null,
+        'platform_name' => $this->getZinaraPlatform(),
+        'zinara_credential' => Auth::user()->zinara_credential,
+        'icecash_credential' => Auth::user()->icecash_credential,
     ]);
     
     return redirect()->route('facevaluelist')->with('success', 'Face value record declared successfully.');
@@ -2004,7 +2044,9 @@ public function store(Request $request)
         'face_values_used' => $faceValuesUsed,
         'closing_balance' => $closingBalance,
         'user_id' => Auth::user()->id,
-        'platform_name' => Auth::user()->site->platform_name ?? null,
+        'platform_name' => $this->getZinaraPlatform(),
+        'zinara_credential' => Auth::user()->zinara_credential,
+        'icecash_credential' => Auth::user()->icecash_credential,
     ]);
     
     return Redirect::back();

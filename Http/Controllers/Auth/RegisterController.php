@@ -52,6 +52,8 @@ class RegisterController extends Controller
             'name' => ['required', 'string', 'max:255'],
             'role' => ['required', 'string', 'max:255'],
             'email' => ['required', 'string', 'email', 'max:255', 'unique:users'],
+            'zinara_credential' => ['nullable', 'string', 'max:255'],
+            'icecash_credential' => ['nullable', 'string', 'max:255'],
             'password' => ['required', 'string', 'min:8', 'confirmed'],
         ]);
     }
@@ -69,6 +71,8 @@ class RegisterController extends Controller
             'role' => $data['role'],
             'siteid' => $data['siteid'],
             'networkid' => $data['networkid'],
+            'zinara_credential' => $data['zinara_credential'] ?? null,
+            'icecash_credential' => $data['icecash_credential'] ?? null,
             'email' => $data['email'],
             'password' => Hash::make($data['password']),
         ]);

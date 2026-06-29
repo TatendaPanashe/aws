@@ -14,9 +14,70 @@ use Illuminate\Support\Facades\Auth;
 
 class TeamsController extends Controller
 {
+    private const COURIER_PLATFORM = 'Courier Connect';
+
     public function __construct()
     {
         $this->middleware('auth');
+    }
+
+    private function courierConnectClerksQuery()
+    {
+        $siteIds = $this->courierConnectSiteIds();
+
+        return User::with(['role', 'site', 'network'])
+            ->where('role_id', 7)
+            ->whereIn('siteid', $siteIds);
+    }
+
+    private function courierConnectSiteIds()
+    {
+        return site::whereRaw('UPPER(TRIM(platform_name)) = ?', [strtoupper(self::COURIER_PLATFORM)])
+            ->pluck('id');
+    }
+
+    private function courierConnectSiteClerksQuery()
+    {
+        $siteIds = $this->courierConnectSiteIds();
+
+        return User::with(['role', 'site', 'network'])
+            ->whereIn('role_id', [2, 7])
+            ->whereIn('siteid', $siteIds);
+    }
+
+    private function isCourierConnectClerk(User $user): bool
+    {
+        $user->loadMissing('site');
+
+        return (int) $user->role_id === 7
+            && strtoupper(trim((string) optional($user->site)->platform_name)) === strtoupper(self::COURIER_PLATFORM);
+    }
+
+    private function courierConnectSites()
+    {
+        return site::whereRaw('UPPER(TRIM(platform_name)) = ?', [strtoupper(self::COURIER_PLATFORM)])
+            ->orderBy('site_name')
+            ->get();
+    }
+
+    public function viewCourierClerks()
+    {
+        abort_unless((int) Auth::user()->role_id === 6, 403);
+
+        $users = $this->courierConnectSiteClerksQuery()
+            ->orderBy('name')
+            ->get();
+
+        return view('teams.courier-clerks', compact('users'));
+    }
+
+    private function networksForSites($sites)
+    {
+        $networkIds = $sites->pluck('network_id')->filter()->unique()->values();
+
+        return Network::whereIn('id', $networkIds->isNotEmpty() ? $networkIds : [-1])
+            ->orderBy('name')
+            ->get();
     }
 
     protected function resetpwd($id)
@@ -27,7 +88,7 @@ class TeamsController extends Controller
         $currentUser = Auth::user();
         $roleId = (int) $currentUser->role_id;
         
-        if ($roleId == 6 && ($user->role_id != 7 || $user->created_by != $currentUser->id)) {
+        if ($roleId == 6 && !$this->isCourierConnectClerk($user)) {
             return redirect()->back()->with('error', 'Unauthorized action.');
         }
         
@@ -44,6 +105,7 @@ class TeamsController extends Controller
     $roleId = (int) $user->role_id;
     $isZINARASupervisor = ($roleId == 6);
     $isZINARAClerk = ($roleId == 7);
+    $isZIMPOSTViewer = ($roleId == 8);
     
     // Debug: Log the current user and role
     \Log::info('===== TEAMS INDEX DEBUG =====');
@@ -51,23 +113,11 @@ class TeamsController extends Controller
     \Log::info('Current User Role ID: ' . $roleId);
     
     if ($isZINARASupervisor) {
-        // ZINARA Supervisor - only see ZINARA Clerks they created
-        $users = User::with(['role', 'site', 'network'])
-            ->where('role_id', 7)
-            ->where('created_by', $user->id)
+        $users = $this->courierConnectClerksQuery()
             ->orderBy('name')
             ->get();
         
         \Log::info('ZINARA Supervisor - Users found: ' . $users->count());
-        
-        // If no users found, show all ZINARA clerks for debugging (temporary)
-        if($users->isEmpty()) {
-            \Log::warning('No ZINARA clerks found with created_by=' . $user->id);
-            $users = User::with(['role', 'site', 'network'])
-                ->where('role_id', 7)
-                ->get();
-            \Log::info('All ZINARA clerks in system: ' . $users->count());
-        }
     } 
     elseif ($isZINARAClerk) {
         // ZINARA Clerk - only see themselves
@@ -115,16 +165,8 @@ class TeamsController extends Controller
         $preselectedSiteId = $request->query('site_id');
         
         if ($isZINARASupervisor) {
-            // ZINARA Supervisor can only create ZINARA Clerks
-            $sbu3Network = Network::where('name', 'SBU3')->first();
-            
-            if ($sbu3Network) {
-                $networks = Network::where('name', 'SBU3')->get();
-                $sites = site::where('sbu', 'SBU3')->orWhere('network_id', $sbu3Network->id)->get();
-            } else {
-                $networks = collect();
-                $sites = collect();
-            }
+            $sites = $this->courierConnectSites();
+            $networks = $this->networksForSites($sites);
             
             $roles = Role::where('id', 7)->get(); // Only ZINARA Clerk role
         } 
@@ -168,16 +210,21 @@ class TeamsController extends Controller
             'role' => 'required|exists:roles,id',
             'networkid' => 'required|exists:network,id',
             'siteid' => 'required|exists:site,id',
+            'zinara_credential' => 'nullable|string|max:255',
+            'icecash_credential' => 'nullable|string|max:255',
         ];
         
         // Role-specific restrictions
         if ($isZINARASupervisor) {
             $request->merge(['role' => 7]); // Force ZINARA Clerk role
-            
-            $sbu3Network = Network::where('name', 'SBU3')->first();
-            if ($sbu3Network) {
-                $request->merge(['networkid' => $sbu3Network->id]);
+
+            $selectedSite = site::find($request->input('siteid'));
+
+            if (!$selectedSite || strtoupper(trim((string) $selectedSite->platform_name)) !== strtoupper(self::COURIER_PLATFORM)) {
+                return redirect()->back()->withInput()->with('error', 'Courier clerks must be assigned to a Courier Connect site.');
             }
+
+            $request->merge(['networkid' => $selectedSite->network_id]);
         } elseif ($roleId == 3) {
             $request->merge(['role' => 2]); // Force regular Clerk role
         }
@@ -191,6 +238,8 @@ class TeamsController extends Controller
             'role_id' => $request->input('role'),
             'siteid' => $request->input('siteid'),
             'networkid' => $request->input('networkid'),
+            'zinara_credential' => $request->input('zinara_credential'),
+            'icecash_credential' => $request->input('icecash_credential'),
             'email' => $request->input('email'),
             'password' => Hash::make($request->input('password')),
             'created_by' => Auth::id(),
@@ -218,7 +267,7 @@ class TeamsController extends Controller
 
         // Authorization checks
         if ($roleId == 6) { // ZINARA Supervisor
-            if ($user->created_by != $currentUser->id || $user->role_id != 7) {
+            if (!$this->isCourierConnectClerk($user)) {
                 abort(403, 'Unauthorized access.');
             }
         } elseif ($roleId == 7) { // ZINARA Clerk
@@ -234,8 +283,8 @@ class TeamsController extends Controller
         // Get roles based on current user's role
         if ($roleId == 6) {
             $roles = Role::where('id', 7)->get();
-            $networks = Network::where('name', 'SBU3')->get();
-            $sites = site::where('sbu', 'SBU3')->get();
+            $sites = $this->courierConnectSites();
+            $networks = $this->networksForSites($sites);
         } elseif ($roleId == 3) {
             $roles = Role::where('id', 2)->get();
             $networks = Network::all();
@@ -261,7 +310,7 @@ class TeamsController extends Controller
 
         // Authorization checks
         if ($roleId == 6) { // ZINARA Supervisor
-            if ($user->created_by != $currentUser->id || $user->role_id != 7) {
+            if (!$this->isCourierConnectClerk($user)) {
                 abort(403, 'Unauthorized access.');
             }
         } elseif ($roleId == 7) { // ZINARA Clerk
@@ -279,10 +328,20 @@ class TeamsController extends Controller
             'email' => 'required|email|unique:users,email,' . $id,
             'networkid' => 'required|exists:network,id',
             'siteid' => 'required|exists:site,id',
+            'zinara_credential' => 'nullable|string|max:255',
+            'icecash_credential' => 'nullable|string|max:255',
         ];
         
         if ($roleId == 6) {
             $rules['role'] = 'required|in:7';
+
+            $selectedSite = site::find($request->input('siteid'));
+
+            if (!$selectedSite || strtoupper(trim((string) $selectedSite->platform_name)) !== strtoupper(self::COURIER_PLATFORM)) {
+                return redirect()->back()->withInput()->with('error', 'Courier clerks must be assigned to a Courier Connect site.');
+            }
+
+            $request->merge(['networkid' => $selectedSite->network_id]);
         } elseif ($roleId == 3) {
             $rules['role'] = 'required|in:2';
         } elseif ($roleId != 7) {
@@ -300,6 +359,8 @@ class TeamsController extends Controller
         
         $user->networkid = $request->networkid;
         $user->siteid = $request->siteid;
+        $user->zinara_credential = $request->input('zinara_credential');
+        $user->icecash_credential = $request->input('icecash_credential');
     
         if ($request->filled('password')) {
             $user->password = Hash::make($request->password);
@@ -322,7 +383,7 @@ class TeamsController extends Controller
 
         // Authorization checks
         if ($roleId == 6) { // ZINARA Supervisor
-            if ($user->created_by != $currentUser->id || $user->role_id != 7) {
+            if (!$this->isSbu3CourierClerk($user)) {
                 return redirect()->back()->with('error', 'Unauthorized access.');
             }
         } elseif ($roleId == 7) { // ZINARA Clerk

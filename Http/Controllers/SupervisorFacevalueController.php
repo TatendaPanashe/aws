@@ -52,44 +52,15 @@ class SupervisorFacevalueController extends Controller
      */
     private function calculateEndingRange(string $startingRange, int $quantity): string
     {
-        if (strlen($startingRange) < 2) {
+        $serial = $this->parseFaceValueSerial($startingRange);
+
+        if (!$serial || $quantity <= 0) {
             return $startingRange;
         }
-        
-        // Remove the last character (check digit)
-        $baseSerial = substr($startingRange, 0, -1);
-        $checkDigit = substr($startingRange, -1);
-        
-        // Extract prefix (letters) and numeric part
-        $prefix = '';
-        $numericPart = '';
-        
-        for ($i = 0; $i < strlen($baseSerial); $i++) {
-            if (is_numeric($baseSerial[$i])) {
-                $numericPart = substr($baseSerial, $i);
-                $prefix = substr($baseSerial, 0, $i);
-                break;
-            }
-        }
-        
-        // If no prefix found, treat entire string as numeric (except check digit)
-        if ($numericPart === '') {
-            $numericPart = $baseSerial;
-            $prefix = '';
-        }
-        
-        // Calculate new numeric value
-        $numericValue = (int) $numericPart;
-        $newNumericValue = $numericValue + $quantity - 1;
-        
-        // Preserve the same number of digits (pad with leading zeros)
-        $newNumericPadded = str_pad((string) $newNumericValue, strlen($numericPart), '0', STR_PAD_LEFT);
-        
-        // Build ending range (without check digit first, then add original check digit)
-        $endingBase = $prefix . $newNumericPadded;
-        $endingRange = $endingBase . $checkDigit;
-        
-        return $endingRange;
+
+        $endingNumeric = $this->addToNumericString($serial['numeric'], $quantity - 1);
+
+        return $this->formatFaceValueSerial($endingNumeric, $serial['prefix'], $serial['suffix'], $serial['width']);
     }
     
     /**
@@ -97,39 +68,71 @@ class SupervisorFacevalueController extends Controller
      */
     private function calculateNextStartingRange(string $startingRange, int $allocatedAmount): string
     {
-        if (strlen($startingRange) < 2) {
+        $serial = $this->parseFaceValueSerial($startingRange);
+
+        if (!$serial || $allocatedAmount <= 0) {
             return $startingRange;
         }
-        
-        // Remove the last character (check digit)
-        $baseSerial = substr($startingRange, 0, -1);
-        $checkDigit = substr($startingRange, -1);
-        
-        // Extract prefix and numeric part
-        $prefix = '';
-        $numericPart = '';
-        
-        for ($i = 0; $i < strlen($baseSerial); $i++) {
-            if (is_numeric($baseSerial[$i])) {
-                $numericPart = substr($baseSerial, $i);
-                $prefix = substr($baseSerial, 0, $i);
-                break;
-            }
+
+        $nextNumeric = $this->addToNumericString($serial['numeric'], $allocatedAmount);
+
+        return $this->formatFaceValueSerial($nextNumeric, $serial['prefix'], $serial['suffix'], $serial['width']);
+    }
+
+    private function parseFaceValueSerial(?string $value): ?array
+    {
+        $normalized = strtoupper(preg_replace('/[^A-Z0-9]/', '', trim((string) $value)));
+
+        if ($normalized === '' || strlen($normalized) < 2) {
+            return null;
         }
-        
+
+        $basePart = substr($normalized, 0, -1);
+        $suffix = substr($normalized, -1);
+        $prefix = preg_replace('/[0-9]/', '', $basePart);
+        $numericPart = preg_replace('/[^0-9]/', '', $basePart);
+
         if ($numericPart === '') {
-            $numericPart = $baseSerial;
-            $prefix = '';
+            return null;
         }
-        
-        // Calculate next starting value
-        $numericValue = (int) $numericPart;
-        $nextNumericValue = $numericValue + $allocatedAmount;
-        
-        // Preserve number of digits
-        $nextNumericPadded = str_pad((string) $nextNumericValue, strlen($numericPart), '0', STR_PAD_LEFT);
-        
-        return $prefix . $nextNumericPadded . $checkDigit;
+
+        return [
+            'numeric' => ltrim($numericPart, '0') !== '' ? ltrim($numericPart, '0') : '0',
+            'width' => strlen($numericPart),
+            'prefix' => $prefix,
+            'suffix' => $suffix,
+        ];
+    }
+
+    private function addToNumericString(string $base, int $increment): string
+    {
+        $result = str_split($base !== '' ? $base : '0');
+        $carry = $increment;
+        $index = count($result) - 1;
+
+        while ($index >= 0 || $carry > 0) {
+            $digit = $index >= 0 ? (int) $result[$index] : 0;
+            $sum = $digit + ($carry % 10);
+            $carry = intdiv($carry, 10) + intdiv($sum, 10);
+            $newDigit = (string) ($sum % 10);
+
+            if ($index >= 0) {
+                $result[$index] = $newDigit;
+            } else {
+                array_unshift($result, $newDigit);
+            }
+
+            $index--;
+        }
+
+        $value = implode('', $result);
+
+        return ltrim($value, '0') !== '' ? ltrim($value, '0') : '0';
+    }
+
+    private function formatFaceValueSerial(string $numeric, string $prefix, string $suffix, int $width): string
+    {
+        return $prefix . str_pad($numeric, max($width, strlen($numeric)), '0', STR_PAD_LEFT) . $suffix;
     }
 
     private function isCourierSupervisor(?string $userSBU = null): bool
@@ -170,7 +173,20 @@ class SupervisorFacevalueController extends Controller
         $siteSbu = $this->normalizeSbuValue($user->site->sbu ?? null);
         $networkSbu = $this->normalizeSbuValue($user->network->name ?? null);
 
+        if ($normalizedUserSbu === self::COURIER_SBU) {
+            return $siteSbu === self::COURIER_SBU;
+        }
+
         return $siteSbu === $normalizedUserSbu || $networkSbu === $normalizedUserSbu;
+    }
+
+    private function activeClerkBatchCount(int $clerkId): int
+    {
+        return FaceValue::where('clerk_id', $clerkId)
+            ->where('is_parent', true)
+            ->where('batch_balance', '>', 0)
+            ->distinct('batch_id')
+            ->count('batch_id');
     }
     
     /**
@@ -325,12 +341,28 @@ class SupervisorFacevalueController extends Controller
             }
         }
 
+        $activeBatchCounts = FaceValue::whereIn('clerk_id', $clerks->pluck('id'))
+            ->where('is_parent', true)
+            ->where('batch_balance', '>', 0)
+            ->selectRaw('clerk_id, COUNT(DISTINCT batch_id) as active_batch_count')
+            ->groupBy('clerk_id')
+            ->pluck('active_batch_count', 'clerk_id');
+
+        $activeBatchIdsByClerk = FaceValue::whereIn('clerk_id', $clerks->pluck('id'))
+            ->where('is_parent', true)
+            ->where('batch_balance', '>', 0)
+            ->get(['clerk_id', 'batch_id'])
+            ->groupBy('clerk_id')
+            ->map(fn ($rows) => $rows->pluck('batch_id')->unique()->values());
+
         return view('supervisorfacevalues.allocate', compact(
             'clerks', 
             'supervisorfacevalues', 
             'allocations', 
             'totalAllocated',
-            'userSBU'
+            'userSBU',
+            'activeBatchCounts',
+            'activeBatchIdsByClerk'
         ));
     }
 
@@ -338,6 +370,10 @@ class SupervisorFacevalueController extends Controller
     {
         $batchnumber = $request->input('batch_id');
         $updatestock = Supervisorfacevalues::where('id', $batchnumber)->first();
+
+        if (!$updatestock) {
+            return redirect()->back()->with('error', 'Batch not found.');
+        }
         
         // Verify the supervisor owns this stock
         if ($updatestock->user_id != Auth::id()) {
@@ -354,6 +390,16 @@ class SupervisorFacevalueController extends Controller
             if (!$clerk || !$this->userMatchesSbu($clerk, $userSBU)) {
                 return redirect()->back()->with('error', 'Courier supervisors can only allocate to SBU3 users.');
             }
+        }
+
+        $alreadyHasThisActiveBatch = FaceValue::where('clerk_id', $clerkId)
+            ->where('is_parent', true)
+            ->where('batch_balance', '>', 0)
+            ->where('batch_id', $batchnumber)
+            ->exists();
+
+        if (!$alreadyHasThisActiveBatch && $this->activeClerkBatchCount((int) $clerkId) >= 2) {
+            return redirect()->back()->with('error', 'This clerk already has two active face value batches. Allocate another batch only after one is depleted.');
         }
         
         $allocatedAmount = (int) $request->input('received');
@@ -405,6 +451,7 @@ class SupervisorFacevalueController extends Controller
         }
         
         $user = User::where('id', $clerkId)->first();
+        $platformName = $user ? site::whereKey($user->siteid)->value('platform_name') : null;
         
         FaceValue::create([
             'starting' => $startingRange,
@@ -420,6 +467,9 @@ class SupervisorFacevalueController extends Controller
             'batch_id' => $batchnumber,
             'siteid' => $user->siteid ?? null,
             'networkid' => $user->networkid ?? null,
+            'platform_name' => $platformName,
+            'zinara_credential' => $user->zinara_credential ?? null,
+            'icecash_credential' => $user->icecash_credential ?? null,
         ]);
 
         $bid = $batchnumber;

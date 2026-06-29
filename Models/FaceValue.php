@@ -30,6 +30,8 @@ class FaceValue extends Model
         'siteid',
         'networkid',
         'platform_name',
+        'zinara_credential',
+        'icecash_credential',
         'daily_collection_id',
     ];
 

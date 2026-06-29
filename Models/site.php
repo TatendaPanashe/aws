@@ -17,35 +17,12 @@ class site extends Model
         'user_id',
         'code_name',
         'code',
-        'sbu_id',
         'POS',
         'bank',
-        'sbu',
         'platform_name',
       
         
     ];
-
-
-
-    // Relationship to SBU
-    public function sbu()
-    {
-        return $this->belongsTo(SBU::class, 'SBUId');
-    }
-
-    // If you want to get all users through SBU
-    public function usersThroughSBU()
-    {
-        return $this->hasManyThrough(
-            User::class,
-            SBU::class,
-            'id', // Foreign key on SBU table
-            'SBUId', // Foreign key on User table
-            'SBUId', // Local key on Site table
-            'id' // Local key on SBU table
-        );
-    }
 
     public function user()
     {
@@ -55,6 +32,11 @@ class site extends Model
     public function network()
     {
         return $this->belongsTo(Network::class);
+    }
+
+    public function region()
+    {
+        return $this->network();
     }
 
     public function budgets()

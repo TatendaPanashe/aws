@@ -9,6 +9,7 @@ use App\Models\CollectionAmmendments;
 use App\Models\CsvData;
 use App\Models\DailyCollection;
 use App\Models\FaceValue;
+use App\Models\MasterDataChangeRequest;
 use App\Models\Network;
 use App\Models\reports;
 use App\Models\reports as Report;
@@ -23,14 +24,15 @@ use Illuminate\Support\Facades\Schema;
 
 class ReportsController extends Controller
 {
-    private const NON_COURIER_SBUS = ['SBU1', 'SBU2'];
+    private const COURIER_SUPERVISOR_ROLE_ID = 6;
+    private const COURIER_PLATFORM = 'Courier Connect';
 
     public function __construct()
     {
         $this->middleware('auth');
     }
 
-    private function normalizeSbu(?string $value): ?string
+    private function normalizeRegionName(?string $value): ?string
     {
         if ($value === null) {
             return null;
@@ -42,72 +44,99 @@ class ReportsController extends Controller
     }
 
     /**
-     * Get the user's SBU based on their site or network
+     * Get the user's assigned region based on their network
      */
-    private function getUserSBU()
+    private function getUserRegion()
     {
         $user = Auth::user();
-        
-        if($user->site && $user->site->sbu) {
-            return $this->normalizeSbu($user->site->sbu);
+
+        if ((int) $user->role_id === self::COURIER_SUPERVISOR_ROLE_ID) {
+            return self::COURIER_PLATFORM;
         }
         
         if($user->network && $user->network->name) {
-            return $this->normalizeSbu($user->network->name);
+            return $this->normalizeRegionName($user->network->name);
         }
         
         return null;
     }
 
+    private function getUserSBU()
+    {
+        return $this->getUserRegion();
+    }
+
+    private function getVisibleRegionIdsForReports(): array
+    {
+        $user = Auth::user();
+
+        return $user?->networkid ? [(int) $user->networkid] : [];
+    }
+
     private function getVisibleSbusForReports(): array
     {
-        $userSBU = $this->getUserSBU();
+        return Network::whereIn('id', $this->getVisibleRegionIdsForReports())
+            ->pluck('name')
+            ->toArray();
+    }
 
-        if (in_array($userSBU, self::NON_COURIER_SBUS, true)) {
-            return self::NON_COURIER_SBUS;
-        }
-
-        return $userSBU ? [$userSBU] : [];
+    private function normalizeSbu(?string $value): ?string
+    {
+        return $this->normalizeRegionName($value);
     }
 
     private function getReportScopeLabel(): ?string
     {
-        $visibleSbus = $this->getVisibleSbusForReports();
+        return $this->getUserRegion();
+    }
 
-        if ($visibleSbus === self::NON_COURIER_SBUS) {
-            return 'SBU1 & SBU2';
-        }
+    private function isCourierSupervisorRole(int $roleId): bool
+    {
+        return $roleId === self::COURIER_SUPERVISOR_ROLE_ID;
+    }
 
-        return $visibleSbus[0] ?? null;
+    private function getCourierSupervisorSiteIds()
+    {
+        return User::whereIn('role_id', [2, 7])
+            ->whereHas('site', function($q) {
+                $q->whereRaw('UPPER(TRIM(platform_name)) = ?', [strtoupper(self::COURIER_PLATFORM)]);
+            })
+            ->pluck('siteid')
+            ->filter()
+            ->unique()
+            ->values();
+    }
+
+    private function getCourierSupervisorAuthorizedClerkIds(): array
+    {
+        return User::whereIn('role_id', [2, 7])
+            ->whereHas('site', function($q) {
+                $q->whereRaw('UPPER(TRIM(platform_name)) = ?', [strtoupper(self::COURIER_PLATFORM)]);
+            })
+            ->pluck('id')
+            ->toArray();
     }
 
     /**
-     * Get authorized clerk IDs based on user's SBU
+     * Get authorized clerk IDs based on user's assigned region
      */
     private function getAuthorizedClerkIds()
     {
         $user = Auth::user();
         $roleId = (int) $user->role_id;
-        $visibleSbus = $this->getVisibleSbusForReports();
+        $visibleRegionIds = $this->getVisibleRegionIdsForReports();
         
-        // For supervisors (role 3 or 6) with an SBU
-        if (($roleId == 3 || $roleId == 6) && !empty($visibleSbus)) {
+        // Regional managers and supervisors see clerks in their assigned region.
+        if (in_array($roleId, [3, 4], true) && !empty($visibleRegionIds)) {
             $clerkIds = User::whereIn('role_id', [2, 7])
-                ->where(function($query) use ($visibleSbus) {
-                    $query->whereHas('network', function($q) use ($visibleSbus) {
-                        $q->whereIn('name', $visibleSbus);
-                    });
-                    $query->orWhereHas('site', function($q) use ($visibleSbus) {
-                        $q->whereIn('sbu', $visibleSbus);
-                    });
-                })
+                ->whereIn('networkid', $visibleRegionIds)
                 ->pluck('id')
                 ->toArray();
             
             return $clerkIds;
         }
         
-        // For super admin or users without SBU, return empty (means no filter)
+        // For super admin or users without region, return empty (means no filter)
         return [];
     }
 
@@ -118,15 +147,19 @@ class ReportsController extends Controller
     {
         $user = Auth::user();
         $roleId = (int) $user->role_id;
-        $userSBU = $this->getReportScopeLabel();
-        $isSupervisor = ($roleId == 3 || $roleId == 6);
+
+        if ($this->isCourierSupervisorRole($roleId)) {
+            return $this->courierSupervisorIndex();
+        }
+
+        $userRegion = $this->getReportScopeLabel();
+        $isRegionalManager = in_array($roleId, [3, 4], true);
         $authorizedClerkIds = $this->getAuthorizedClerkIds();
         
         $reportWindowStart = Carbon::now()->subDays(30);
         
-        // Filter daily collections based on user's SBU
         $collectionQuery = DailyCollection::query();
-        if ($isSupervisor && $userSBU && !empty($authorizedClerkIds)) {
+        if ($isRegionalManager && $userRegion && !empty($authorizedClerkIds)) {
             $collectionQuery->whereIn('user_id', $authorizedClerkIds);
         }
         
@@ -134,7 +167,7 @@ class ReportsController extends Controller
             ? $collectionQuery->where('created_at', '>=', $reportWindowStart)->get()
             : collect();
 
-        // Filter collection trend based on user's SBU
+        // Filter collection trend based on user's region
         $collectionTrendQuery = DB::table('daily_collections')
             ->select(
                 DB::raw('DATE(created_at) as date'),
@@ -142,8 +175,8 @@ class ReportsController extends Controller
                 DB::raw('SUM(zwg_insurance_transactions) as total_zwg')
             )
             ->where('created_at', '>=', $reportWindowStart);
-            
-        if ($isSupervisor && $userSBU && !empty($authorizedClerkIds)) {
+
+        if ($isRegionalManager && $userRegion && !empty($authorizedClerkIds)) {
             $collectionTrendQuery->whereIn('user_id', $authorizedClerkIds);
         }
         
@@ -157,14 +190,14 @@ class ReportsController extends Controller
         $collectionTrendUsd = $collectionTrendRows->pluck('total_usd')->map(fn ($value) => (float) $value)->toArray();
         $collectionTrendZwg = $collectionTrendRows->pluck('total_zwg')->map(fn ($value) => (float) $value)->toArray();
 
-        // Filter CSV data based on user's SBU (if applicable)
+        // CSV import data remains global unless a report-specific region filter is added.
         $csvRows = Schema::hasTable('csv_data') ? CsvData::all() : collect();
         $applicationCount = $csvRows->count();
         $applicationAmount = $csvRows->sum(fn ($row) => $this->parseCsvAmount($row->amount));
 
-        // Filter face value stock based on user's SBU
+        // Filter face value stock based on user's region
         $faceValueQuery = Supervisorfacevalues::query();
-        if ($isSupervisor && $userSBU && !empty($authorizedClerkIds)) {
+        if ($isRegionalManager && $userRegion && !empty($authorizedClerkIds)) {
             $faceValueQuery->whereIn('assigned_to', $authorizedClerkIds)
                 ->orWhere('user_id', $user->id);
         }
@@ -193,9 +226,9 @@ class ReportsController extends Controller
             ->take(6)
             ->values();
 
-        // Filter pending amendments based on user's SBU
+        // Filter pending amendments based on user's region
         $amendmentQuery = CollectionAmmendments::query();
-        if ($isSupervisor && $userSBU && !empty($authorizedClerkIds)) {
+        if ($isRegionalManager && $userRegion && !empty($authorizedClerkIds)) {
             $amendmentQuery->whereIn('userid', $authorizedClerkIds);
         }
         
@@ -203,17 +236,26 @@ class ReportsController extends Controller
             ? $amendmentQuery->where('status', 'requested')->count()
             : 0;
 
+        $masterDataChangeQuery = MasterDataChangeRequest::query()->where('status', 'pending');
+        if ($roleId !== 5) {
+            $masterDataChangeQuery->where('requested_by', $user->id);
+        }
+
+        $pendingMasterDataChanges = Schema::hasTable('master_data_change_requests')
+            ? $masterDataChangeQuery->count()
+            : 0;
+
         $summaryCards = [
             [
                 'label' => 'USD Collections (30 Days)',
                 'value' => '$' . number_format($collectionWindow->sum('insurance_transactions'), 2),
-                'note' => 'Combined submitted USD activity in the last 30 days.' . ($userSBU ? " (SBU: $userSBU)" : ''),
+                'note' => 'Combined submitted USD activity in the last 30 days.' . ($userRegion ? " (Region: $userRegion)" : ''),
                 'icon' => 'bi bi-cash-coin',
             ],
             [
                 'label' => 'ZWG Collections (30 Days)',
                 'value' => 'ZWG ' . number_format($collectionWindow->sum('zwg_insurance_transactions'), 2),
-                'note' => 'Local currency collection movement in the last 30 days.' . ($userSBU ? " (SBU: $userSBU)" : ''),
+                'note' => 'Local currency collection movement in the last 30 days.' . ($userRegion ? " (Region: $userRegion)" : ''),
                 'icon' => 'bi bi-wallet2',
             ],
             [
@@ -221,6 +263,12 @@ class ReportsController extends Controller
                 'value' => number_format($pendingAmendments),
                 'note' => 'Collection changes waiting review.',
                 'icon' => 'bi bi-pencil-square',
+            ],
+            [
+                'label' => 'Pending Site/Network Changes',
+                'value' => number_format($pendingMasterDataChanges),
+                'note' => $roleId === 5 ? 'Master data changes waiting super user approval.' : 'Your submitted site/network changes waiting approval.',
+                'icon' => 'bi bi-shield-check',
             ],
             [
                 'label' => 'Imported Applications',
@@ -293,6 +341,13 @@ class ReportsController extends Controller
                 'chip' => 'CSV data',
             ],
             [
+                'title' => 'Site and Network Change Requests',
+                'description' => 'Trace pending, approved, and rejected site or network information changes.',
+                'route' => route('master-data-change-requests.index'),
+                'icon' => 'bi bi-shield-check',
+                'chip' => 'Approvals',
+            ],
+            [
                 'title' => 'Budget Comparison',
                 'description' => 'Compare planned network budgets against actual collection figures.',
                 'route' => route('budgets.index'),
@@ -300,13 +355,57 @@ class ReportsController extends Controller
                 'chip' => 'Budget vs actual',
             ],
             [
-                'title' => 'SBU Performance Report',
-                'description' => 'View collection performance by Strategic Business Unit (SBU).',
+                'title' => 'Regional Network Report',
+                'description' => 'View collection performance by Region and connected Office nodes.',
                 'route' => route('reports.sbu'),
                 'icon' => 'bi bi-building',
-                'chip' => 'SBU Analysis',
+                'chip' => 'Regional Network',
             ],
         ];
+
+        if (in_array($roleId, [3, 5], true)) {
+            $reportCards[] = [
+                'title' => 'Courier Sales Report',
+                'description' => 'Review all Courier Connect sales, face values used, batches, clerks, and insurers.',
+                'route' => $roleId === 5 ? route('courier.sales.superuser') : route('courier.sales.supervisor'),
+                'icon' => 'bi bi-receipt',
+                'chip' => 'Courier sales',
+            ];
+        }
+
+        if ($roleId === 3) {
+            $reportCards[] = [
+                'title' => 'Only Sales Period Report',
+                'description' => 'Review sales-only Zinara, premium, insurance, and total transaction calculations over a date range.',
+                'route' => route('reports.only-sales.period'),
+                'icon' => 'bi bi-receipt',
+                'chip' => 'Sales only',
+            ];
+
+            $reportCards[] = [
+                'title' => 'Only Sales Daily Report',
+                'description' => 'Review sales-only calculations for a selected day, grouped by site.',
+                'route' => route('reports.only-sales.daily'),
+                'icon' => 'bi bi-calendar-day',
+                'chip' => 'Daily sales',
+            ];
+
+            $reportCards[] = [
+                'title' => 'Only Cash Period Report',
+                'description' => 'Review cash, swipe, transfer, M-POS, receipt, balance, and deposit totals over a date range.',
+                'route' => route('reports.only-cash.period'),
+                'icon' => 'bi bi-cash-stack',
+                'chip' => 'Cash only',
+            ];
+
+            $reportCards[] = [
+                'title' => 'Only Cash Daily Report',
+                'description' => 'Review cash receipt calculations for a selected day across all collection reports.',
+                'route' => route('reports.only-cash.daily'),
+                'icon' => 'bi bi-calendar-check',
+                'chip' => 'Daily cash',
+            ];
+        }
 
         $operationalHighlights = [
             'sites' => number_format($collectionWindow->pluck('siteid')->filter()->unique()->count()),
@@ -330,66 +429,297 @@ class ReportsController extends Controller
         ));
     }
 
+    private function courierSupervisorIndex()
+    {
+        $user = Auth::user();
+        $roleId = (int) $user->role_id;
+        $userSBU = self::COURIER_PLATFORM;
+        $visibleSiteIds = $this->getCourierSupervisorSiteIds();
+        $authorizedClerkIds = $this->getCourierSupervisorAuthorizedClerkIds();
+        $siteScope = $visibleSiteIds->isNotEmpty() ? $visibleSiteIds : [-1];
+        $clerkScope = !empty($authorizedClerkIds) ? $authorizedClerkIds : [-1];
+        $reportWindowStart = Carbon::now()->subDays(30);
+
+        $collectionWindow = Schema::hasTable('daily_collections')
+            ? DailyCollection::query()
+                ->whereIn('user_id', $clerkScope)
+                ->where('created_at', '>=', $reportWindowStart)
+                ->get()
+            : collect();
+
+        $collectionTrendRows = Schema::hasTable('daily_collections')
+            ? DB::table('daily_collections')
+                ->select(
+                    DB::raw('DATE(created_at) as date'),
+                    DB::raw('SUM(insurance_transactions) as total_usd'),
+                    DB::raw('SUM(zwg_insurance_transactions) as total_zwg')
+                )
+                ->whereIn('user_id', $clerkScope)
+                ->where('created_at', '>=', $reportWindowStart)
+                ->groupBy(DB::raw('DATE(created_at)'))
+                ->orderBy(DB::raw('DATE(created_at)'))
+                ->get()
+            : collect();
+
+        $collectionTrendLabels = $collectionTrendRows->pluck('date')->toArray();
+        $collectionTrendUsd = $collectionTrendRows->pluck('total_usd')->map(fn ($value) => (float) $value)->toArray();
+        $collectionTrendZwg = $collectionTrendRows->pluck('total_zwg')->map(fn ($value) => (float) $value)->toArray();
+
+        $csvRows = Schema::hasTable('csv_data') ? CsvData::all() : collect();
+        $applicationCount = $csvRows->count();
+        $applicationAmount = $csvRows->sum(fn ($row) => $this->parseCsvAmount($row->amount));
+
+        $faceValueBalance = Schema::hasTable('supervisor_facevalue')
+            ? Supervisorfacevalues::query()
+                ->where(function ($query) use ($clerkScope, $user) {
+                    $query->whereIn('assigned_to', $clerkScope)
+                        ->orWhere('user_id', $user->id);
+                })
+                ->sum('balance')
+            : 0;
+
+        $statusBreakdown = $csvRows
+            ->groupBy(fn ($row) => $row->status ?: 'Unknown')
+            ->map(fn ($rows, $status) => [
+                'label' => $status,
+                'count' => $rows->count(),
+            ])
+            ->sortByDesc('count')
+            ->take(6)
+            ->values();
+
+        $locationBreakdown = $csvRows
+            ->groupBy(fn ($row) => $row->location ?: 'Unknown')
+            ->map(fn ($rows, $location) => [
+                'label' => $location,
+                'count' => $rows->count(),
+            ])
+            ->sortByDesc('count')
+            ->take(6)
+            ->values();
+
+        $pendingAmendments = Schema::hasTable('collection_ammendments')
+            ? CollectionAmmendments::query()
+                ->whereIn('userid', $clerkScope)
+                ->where('status', 'requested')
+                ->count()
+            : 0;
+
+        $pendingMasterDataChanges = Schema::hasTable('master_data_change_requests')
+            ? MasterDataChangeRequest::query()
+                ->where('status', 'pending')
+                ->where('requested_by', $user->id)
+                ->count()
+            : 0;
+
+        $summaryCards = [
+            [
+                'label' => 'USD Collections (30 Days)',
+                'value' => '$' . number_format($collectionWindow->sum('insurance_transactions'), 2),
+                'note' => "Combined submitted USD activity in the last 30 days. (Platform: $userSBU)",
+                'icon' => 'bi bi-cash-coin',
+            ],
+            [
+                'label' => 'ZWG Collections (30 Days)',
+                'value' => 'ZWG ' . number_format($collectionWindow->sum('zwg_insurance_transactions'), 2),
+                'note' => "Local currency collection movement in the last 30 days. (Platform: $userSBU)",
+                'icon' => 'bi bi-wallet2',
+            ],
+            [
+                'label' => 'Pending Amendments',
+                'value' => number_format($pendingAmendments),
+                'note' => 'Collection changes waiting review.',
+                'icon' => 'bi bi-pencil-square',
+            ],
+            [
+                'label' => 'Pending Site/Network Changes',
+                'value' => number_format($pendingMasterDataChanges),
+                'note' => 'Your submitted site/network changes waiting approval.',
+                'icon' => 'bi bi-shield-check',
+            ],
+            [
+                'label' => 'Imported Applications',
+                'value' => number_format($applicationCount),
+                'note' => 'CSV application and premium records in the dataset.',
+                'icon' => 'bi bi-file-earmark-text',
+            ],
+            [
+                'label' => 'Application Premium Value',
+                'value' => '$' . number_format($applicationAmount, 2),
+                'note' => 'Amount represented by uploaded application records.',
+                'icon' => 'bi bi-graph-up-arrow',
+            ],
+            [
+                'label' => 'Face Value Stock Balance',
+                'value' => number_format($faceValueBalance, 2),
+                'note' => 'Current supervisor-level stock still in the system.',
+                'icon' => 'bi bi-stack',
+            ],
+        ];
+
+        $reportCards = [
+            [
+                'title' => 'Network Collection Report',
+                'description' => 'Filter Courier Connect collections by network, site, and date range for operational review.',
+                'route' => route('collectionreports'),
+                'icon' => 'bi bi-globe2',
+                'chip' => 'Collections',
+            ],
+            [
+                'title' => 'Site Collection Report',
+                'description' => 'Inspect detailed USD and ZWG activity across Courier Connect sites.',
+                'route' => route('bysitesreports'),
+                'icon' => 'bi bi-building',
+                'chip' => 'Site detail',
+            ],
+            [
+                'title' => 'Cumulative Network Report',
+                'description' => 'Summarize Courier transactions, premiums, and deposits by network over a period.',
+                'route' => route('cumulativeNetworkReport'),
+                'icon' => 'bi bi-bar-chart-line',
+                'chip' => 'Cumulative',
+            ],
+            [
+                'title' => 'User Performance Report',
+                'description' => 'Break down collection activity for an individual Courier clerk.',
+                'route' => route('user.reports'),
+                'icon' => 'bi bi-person-lines-fill',
+                'chip' => 'User focus',
+            ],
+            [
+                'title' => 'Face Value Client History',
+                'description' => 'Review Courier face value allocations and balances across clerks.',
+                'route' => route('clientfvreport'),
+                'icon' => 'bi bi-upc-scan',
+                'chip' => 'Face values',
+            ],
+            [
+                'title' => 'Face Value Cumulative Report',
+                'description' => 'Summarize opening, received, used, spoiled, and closing positions across a period.',
+                'route' => route('cumulativefvreport'),
+                'icon' => 'bi bi-archive',
+                'chip' => 'Stock history',
+            ],
+            [
+                'title' => 'Courier Connect Performance Report',
+                'description' => 'View collection performance for Courier Connect sites.',
+                'route' => route('reports.sbu'),
+                'icon' => 'bi bi-building',
+                'chip' => 'Regional Network',
+            ],
+            [
+                'title' => 'Only Sales Period Report',
+                'description' => 'Review sales-only Zinara, premium, insurance, and total transaction calculations over a date range.',
+                'route' => route('reports.only-sales.period'),
+                'icon' => 'bi bi-receipt',
+                'chip' => 'Sales only',
+            ],
+            [
+                'title' => 'Only Sales Daily Report',
+                'description' => 'Review sales-only calculations for a selected day, grouped by Courier Connect site.',
+                'route' => route('reports.only-sales.daily'),
+                'icon' => 'bi bi-calendar-day',
+                'chip' => 'Daily sales',
+            ],
+            [
+                'title' => 'Only Cash Period Report',
+                'description' => 'Review cash, swipe, transfer, M-POS, receipt, balance, and deposit totals over a date range.',
+                'route' => route('reports.only-cash.period'),
+                'icon' => 'bi bi-cash-stack',
+                'chip' => 'Cash only',
+            ],
+            [
+                'title' => 'Only Cash Daily Report',
+                'description' => 'Review cash receipt calculations for a selected day across Courier collection reports.',
+                'route' => route('reports.only-cash.daily'),
+                'icon' => 'bi bi-calendar-check',
+                'chip' => 'Daily cash',
+            ],
+        ];
+
+        $operationalHighlights = [
+            'sites' => number_format($collectionWindow->pluck('siteid')->filter()->unique()->count()),
+            'users' => number_format($collectionWindow->pluck('user_id')->filter()->unique()->count()),
+            'networks' => number_format($collectionWindow->pluck('networkid')->filter()->unique()->count()),
+            'budgets' => number_format(Schema::hasTable('budgets') ? Budget::count() : 0),
+            'face_values' => number_format(Schema::hasTable('face_values') ? FaceValue::whereIn('clerk_id', $clerkScope)->count() : 0),
+            'users_total' => number_format(Schema::hasTable('users') ? User::whereIn('id', $clerkScope)->count() : 0),
+        ];
+
+        return view('Reports.hub', compact(
+            'summaryCards',
+            'reportCards',
+            'collectionTrendLabels',
+            'collectionTrendUsd',
+            'collectionTrendZwg',
+            'statusBreakdown',
+            'locationBreakdown',
+            'operationalHighlights',
+            'userSBU'
+        ));
+    }
+
     /**
-     * SBU Report - Shows performance by SBU
+     * Regional Network Report - Shows performance by Region.
      */
     public function sbuReport(Request $request)
     {
         $user = Auth::user();
         $roleId = (int) $user->role_id;
-        $isCourierViewer = ($roleId === 8);
-        $userSBU = $this->getUserSBU();
-        $visibleSbus = $isCourierViewer ? ['SBU3'] : $this->getVisibleSbusForReports();
-        $isSupervisor = ($roleId == 3 || $roleId == 6);
+
+        if ($this->isCourierSupervisorRole($roleId)) {
+            return $this->courierSupervisorSbuReport($request);
+        }
+
+        $userRegion = $this->getUserRegion();
+        $visibleRegionIds = in_array($roleId, [3, 4, 8], true) ? $this->getVisibleRegionIdsForReports() : [];
+        $isRegionalManager = in_array($roleId, [3, 4, 8], true);
         $authorizedClerkIds = $this->getAuthorizedClerkIds();
         
         $startDate = $request->filled('start_date') ? Carbon::parse($request->start_date) : Carbon::now()->startOfMonth();
         $endDate = $request->filled('end_date') ? Carbon::parse($request->end_date) : Carbon::now();
         
-        // Base query for daily collections
         $query = DailyCollection::whereBetween('created_at', [$startDate, $endDate]);
         
-        // Apply user filter for supervisors only
-        if ($isSupervisor && !empty($authorizedClerkIds)) {
+        if ($isRegionalManager && !empty($authorizedClerkIds)) {
             $query->whereIn('user_id', $authorizedClerkIds);
         }
         
-        // Get all SBUs from sites table (filtered by user's access)
-        $sbuQuery = site::whereNotNull('sbu')->where('sbu', '!=', '')->distinct();
+        $regionQuery = Network::query()->withCount(['offices as site_count']);
         
-        if (!empty($visibleSbus)) {
-            $sbuQuery->whereIn('sbu', $visibleSbus);
+        if (!empty($visibleRegionIds)) {
+            $regionQuery->whereIn('id', $visibleRegionIds);
         }
         
-        $sbuList = $sbuQuery->pluck('sbu');
+        $regions = $regionQuery->orderBy('name')->get();
         
         $sbuReports = [];
         
-        foreach ($sbuList as $sbu) {
-            // Get sites in this SBU
-            $siteIds = site::where('sbu', $sbu)->pluck('id')->toArray();
+        foreach ($regions as $region) {
+            $siteIds = site::where('network_id', $region->id)->pluck('id')->toArray();
             
             if (empty($siteIds)) {
                 continue;
             }
             
-            $sbuData = (clone $query)
+            $regionData = (clone $query)
                 ->whereIn('siteid', $siteIds)
                 ->get();
             
             $sbuReports[] = [
-                'sbu' => $sbu,
-                'usd_total' => $sbuData->sum('insurance_transactions'),
-                'zwg_total' => $sbuData->sum('zwg_insurance_transactions'),
+                'region_id' => $region->id,
+                'region' => $region->name,
+                'usd_total' => $regionData->sum('insurance_transactions'),
+                'zwg_total' => $regionData->sum('zwg_insurance_transactions'),
                 'site_count' => count($siteIds),
-                'active_sites' => $sbuData->pluck('siteid')->unique()->count(),
-                'transaction_count' => $sbuData->count(),
-                'usd_cash' => $sbuData->sum('usd_cash'),
-                'usd_swipe' => $sbuData->sum('usd_swipe'),
-                'usd_transfers' => $sbuData->sum('usd_transfers'),
-                'zwg_cash' => $sbuData->sum('zwg_cash'),
-                'zwg_swipe' => $sbuData->sum('zwg_swipe'),
-                'zwg_transfers' => $sbuData->sum('zwg_transfers'),
+                'active_sites' => $regionData->pluck('siteid')->unique()->count(),
+                'transaction_count' => $regionData->count(),
+                'usd_cash' => $regionData->sum('usd_cash'),
+                'usd_swipe' => $regionData->sum('usd_swipe'),
+                'usd_transfers' => $regionData->sum('usd_transfers'),
+                'zwg_cash' => $regionData->sum('zwg_cash'),
+                'zwg_swipe' => $regionData->sum('zwg_swipe'),
+                'zwg_transfers' => $regionData->sum('zwg_transfers'),
             ];
         }
         
@@ -404,45 +734,102 @@ class ReportsController extends Controller
             [
                 'label' => 'Total USD Collections',
                 'value' => '$' . number_format($totalUsd, 2),
-                'note' => 'Combined USD across all accessible SBUs',
+                'note' => 'Combined USD across all accessible Regional Networks',
                 'icon' => 'bi bi-cash-coin',
             ],
             [
                 'label' => 'Total ZWG Collections',
                 'value' => 'ZWG ' . number_format($totalZwg, 2),
-                'note' => 'Combined ZWG across all accessible SBUs',
+                'note' => 'Combined ZWG across all accessible Regional Networks',
                 'icon' => 'bi bi-wallet2',
             ],
             [
-                'label' => 'Active SBUs',
+                'label' => 'Active Regional Networks',
                 'value' => number_format($sbuReports->where('usd_total', '>', 0)->count()),
-                'note' => 'SBUs with collection activity',
+                'note' => 'Regions with collection activity',
+                'icon' => 'bi bi-building',
+            ],
+            [
+                'label' => 'Connected Office Nodes',
+                'value' => number_format($sbuReports->sum('site_count')),
+                'note' => 'All offices in accessible Regions',
+                'icon' => 'bi bi-pin-map',
+            ],
+        ];
+        
+        return view('Reports.sbu', compact('sbuReports', 'summaryCards', 'startDate', 'endDate', 'userRegion'));
+    }
+
+    private function courierSupervisorSbuReport(Request $request)
+    {
+        $userRegion = self::COURIER_PLATFORM;
+        $startDate = $request->filled('start_date') ? Carbon::parse($request->start_date) : Carbon::now()->startOfMonth();
+        $endDate = $request->filled('end_date') ? Carbon::parse($request->end_date) : Carbon::now();
+        $siteIds = $this->getCourierSupervisorSiteIds()->toArray();
+        $clerkIds = $this->getCourierSupervisorAuthorizedClerkIds();
+
+        $sbuData = DailyCollection::whereBetween('created_at', [$startDate, $endDate])
+            ->whereIn('user_id', !empty($clerkIds) ? $clerkIds : [-1])
+            ->get();
+
+        $sbuReports = collect([
+            [
+                'region_id' => self::COURIER_PLATFORM,
+                'region' => self::COURIER_PLATFORM,
+                'usd_total' => $sbuData->sum('insurance_transactions'),
+                'zwg_total' => $sbuData->sum('zwg_insurance_transactions'),
+                'site_count' => count($siteIds),
+                'active_sites' => $sbuData->pluck('siteid')->unique()->count(),
+                'transaction_count' => $sbuData->count(),
+                'usd_cash' => $sbuData->sum('usd_cash'),
+                'usd_swipe' => $sbuData->sum('usd_swipe'),
+                'usd_transfers' => $sbuData->sum('usd_transfers'),
+                'zwg_cash' => $sbuData->sum('zwg_cash'),
+                'zwg_swipe' => $sbuData->sum('zwg_swipe'),
+                'zwg_transfers' => $sbuData->sum('zwg_transfers'),
+            ],
+        ]);
+
+        $summaryCards = [
+            [
+                'label' => 'Total USD Collections',
+                'value' => '$' . number_format($sbuReports->sum('usd_total'), 2),
+                'note' => 'Combined USD across Courier Connect sites',
+                'icon' => 'bi bi-cash-coin',
+            ],
+            [
+                'label' => 'Total ZWG Collections',
+                'value' => 'ZWG ' . number_format($sbuReports->sum('zwg_total'), 2),
+                'note' => 'Combined ZWG across Courier Connect sites',
+                'icon' => 'bi bi-wallet2',
+            ],
+            [
+                'label' => 'Active Regional Networks',
+                'value' => number_format($sbuReports->where('usd_total', '>', 0)->count()),
+                'note' => 'Courier Connect platform activity',
                 'icon' => 'bi bi-building',
             ],
             [
                 'label' => 'Total Sites',
                 'value' => number_format($sbuReports->sum('site_count')),
-                'note' => 'All sites in accessible SBUs',
+                'note' => 'All Courier Connect sites',
                 'icon' => 'bi bi-pin-map',
             ],
         ];
-        
-        return view('Reports.sbu', compact('sbuReports', 'summaryCards', 'startDate', 'endDate', 'userSBU', 'visibleSbus'));
+
+        return view('Reports.sbu', compact('sbuReports', 'summaryCards', 'startDate', 'endDate', 'userRegion'));
     }
 
     public function platformReport(Request $request)
     {
         $roleId = (int) Auth::user()->role_id;
+
+        abort_unless(in_array($roleId, [1, 3, 4, 5], true), 403);
+
         $startDate = $request->filled('startdate') ? Carbon::parse($request->input('startdate'))->startOfDay() : Carbon::now()->startOfMonth();
         $endDate = $request->filled('enddate') ? Carbon::parse($request->input('enddate'))->endOfDay() : Carbon::now()->endOfDay();
 
         $query = DailyCollection::whereBetween('created_at', [$startDate, $endDate]);
-
-        if ($roleId === 8) {
-            $query->whereHas('site', function ($siteQuery) {
-                $siteQuery->where('sbu', 'SBU3');
-            });
-        }
 
         $platformReports = $query
             ->whereNotNull('platform_name')
@@ -461,34 +848,32 @@ class ReportsController extends Controller
     }
 
     /**
-     * SBU Detail Report - Shows sites within a specific SBU
+     * Regional Network Detail Report - Shows offices within a specific Region.
      */
-    public function sbuDetailReport(Request $request, $sbu)
+    public function sbuDetailReport(Request $request, $regionId)
     {
         $user = Auth::user();
         $roleId = (int) $user->role_id;
-        $isCourierViewer = ($roleId === 8);
-        $userSBU = $this->getUserSBU();
-        $visibleSbus = $isCourierViewer ? ['SBU3'] : $this->getVisibleSbusForReports();
-        $isSupervisor = ($roleId == 3 || $roleId == 6);
-        $authorizedClerkIds = $this->getAuthorizedClerkIds();
-        
-        // Check if user has access to this SBU
-        if (($isSupervisor && !empty($visibleSbus) && !in_array(strtoupper($sbu), array_map('strtoupper', $visibleSbus)))
-            || ($isCourierViewer && strtoupper($sbu) !== 'SBU3')) {
-            abort(403, 'You do not have access to this SBU report.');
+
+        if ($this->isCourierSupervisorRole($roleId)) {
+            return $this->courierSupervisorSbuDetailReport($request, $regionId);
         }
-        
-        $normalizedSbu = $this->normalizeSbu($sbu);
+
+        $userRegion = $this->getUserRegion();
+        $visibleRegionIds = in_array($roleId, [3, 4, 8], true) ? $this->getVisibleRegionIdsForReports() : [];
+
+        if (!empty($visibleRegionIds) && !in_array((int) $regionId, $visibleRegionIds, true)) {
+            abort(403, 'You do not have access to this Regional Network report.');
+        }
+
+        $region = Network::findOrFail($regionId);
         
         $startDate = $request->filled('start_date') ? Carbon::parse($request->start_date) : Carbon::now()->startOfMonth();
         $endDate = $request->filled('end_date') ? Carbon::parse($request->end_date) : Carbon::now();
         
-        // Get all sites in this SBU
-        $sites = site::where('sbu', $normalizedSbu)->get();
+        $sites = site::where('network_id', $region->id)->get();
         $siteIds = $sites->pluck('id')->toArray();
         
-        // Base query
         $query = DailyCollection::whereBetween('created_at', [$startDate, $endDate])
             ->whereIn('siteid', $siteIds);
         
@@ -528,13 +913,89 @@ class ReportsController extends Controller
             [
                 'label' => 'Total USD Collections',
                 'value' => '$' . number_format($totalUsd, 2),
-                'note' => "Total USD for $normalizedSbu",
+                'note' => "Total USD for {$region->name}",
                 'icon' => 'bi bi-cash-coin',
             ],
             [
                 'label' => 'Total ZWG Collections',
                 'value' => 'ZWG ' . number_format($totalZwg, 2),
-                'note' => "Total ZWG for $normalizedSbu",
+                'note' => "Total ZWG for {$region->name}",
+                'icon' => 'bi bi-wallet2',
+            ],
+            [
+                'label' => 'Active Office Nodes',
+                'value' => number_format($siteReports->where('usd_total', '>', 0)->count()),
+                'note' => 'Offices with collection activity',
+                'icon' => 'bi bi-building',
+            ],
+            [
+                'label' => 'Connected Office Nodes',
+                'value' => number_format($siteReports->count()),
+                'note' => 'All offices in this Region',
+                'icon' => 'bi bi-pin-map',
+            ],
+        ];
+        
+        $regionName = $region->name;
+
+        return view('Reports.sbu-detail', compact('siteReports', 'summaryCards', 'startDate', 'endDate', 'regionName', 'userRegion'));
+    }
+
+    private function courierSupervisorSbuDetailReport(Request $request, $sbu)
+    {
+        if (strtoupper(trim((string) $sbu)) !== strtoupper(self::COURIER_PLATFORM)) {
+            abort(403, 'You do not have access to this Courier Connect report.');
+        }
+
+        $userRegion = self::COURIER_PLATFORM;
+        $startDate = $request->filled('start_date') ? Carbon::parse($request->start_date) : Carbon::now()->startOfMonth();
+        $endDate = $request->filled('end_date') ? Carbon::parse($request->end_date) : Carbon::now();
+        $siteIds = $this->getCourierSupervisorSiteIds();
+        $clerkIds = $this->getCourierSupervisorAuthorizedClerkIds();
+        $sites = site::whereIn('id', $siteIds->isNotEmpty() ? $siteIds : [-1])->get();
+        $siteIds = $sites->pluck('id')->toArray();
+        $query = DailyCollection::whereBetween('created_at', [$startDate, $endDate])
+            ->whereIn('user_id', !empty($clerkIds) ? $clerkIds : [-1]);
+
+        $siteReports = [];
+
+        foreach ($sites as $site) {
+            $siteData = (clone $query)
+                ->where('siteid', $site->id)
+                ->get();
+
+            $siteReports[] = [
+                'site_name' => $site->site_name,
+                'site_code' => $site->code,
+                'network' => $site->network->name ?? 'N/A',
+                'platform' => $site->platform_name ?? 'N/A',
+                'usd_total' => $siteData->sum('insurance_transactions'),
+                'zwg_total' => $siteData->sum('zwg_insurance_transactions'),
+                'transaction_count' => $siteData->count(),
+                'usd_cash' => $siteData->sum('usd_cash'),
+                'usd_swipe' => $siteData->sum('usd_swipe'),
+                'usd_transfers' => $siteData->sum('usd_transfers'),
+                'zwg_cash' => $siteData->sum('zwg_cash'),
+                'zwg_swipe' => $siteData->sum('zwg_swipe'),
+                'zwg_transfers' => $siteData->sum('zwg_transfers'),
+            ];
+        }
+
+        $siteReports = collect($siteReports)->sortByDesc('usd_total')->values();
+        $totalUsd = $siteReports->sum('usd_total');
+        $totalZwg = $siteReports->sum('zwg_total');
+
+        $summaryCards = [
+            [
+                'label' => 'Total USD Collections',
+                'value' => '$' . number_format($totalUsd, 2),
+                'note' => 'Combined USD for Courier Connect sites',
+                'icon' => 'bi bi-cash-coin',
+            ],
+            [
+                'label' => 'Total ZWG Collections',
+                'value' => 'ZWG ' . number_format($totalZwg, 2),
+                'note' => 'Combined ZWG for Courier Connect sites',
                 'icon' => 'bi bi-wallet2',
             ],
             [
@@ -544,14 +1005,16 @@ class ReportsController extends Controller
                 'icon' => 'bi bi-building',
             ],
             [
-                'label' => 'Total Sites',
-                'value' => number_format($siteReports->count()),
-                'note' => 'All sites in this SBU',
-                'icon' => 'bi bi-pin-map',
+                'label' => 'Total Transactions',
+                'value' => number_format($siteReports->sum('transaction_count')),
+                'note' => 'Collection submissions in selected period',
+                'icon' => 'bi bi-list-check',
             ],
         ];
-        
-        return view('Reports.sbu-detail', compact('siteReports', 'summaryCards', 'startDate', 'endDate', 'sbu', 'userSBU'));
+
+        $regionName = self::COURIER_PLATFORM;
+
+        return view('Reports.sbu-detail', compact('siteReports', 'summaryCards', 'startDate', 'endDate', 'regionName', 'userRegion'));
     }
 
     public function applicationReports(Request $request)
@@ -689,17 +1152,33 @@ class ReportsController extends Controller
     {
         $user = Auth::user();
         $roleId = (int) $user->role_id;
+
+        if ($this->isCourierSupervisorRole($roleId)) {
+            return $this->courierSupervisorCumulativeNetworkReport($request);
+        }
+
         $userSBU = $this->getReportScopeLabel();
-        $isSupervisor = ($roleId == 3 || $roleId == 6);
+        $isSupervisor = ($roleId == 3);
         $authorizedClerkIds = $this->getAuthorizedClerkIds();
         $visibleSbus = $this->getVisibleSbusForReports();
         
         $startdate = $request->startdate ?: Carbon::now()->startOfMonth()->toDateString();
         $enddate = $request->enddate ?: Carbon::now()->toDateString();
+        $visibleSiteIds = collect();
         
-        // Filter networks based on user's SBU if they are a supervisor
+        // Filter networks based on site.sbu if they are a supervisor.
         if ($isSupervisor && !empty($visibleSbus)) {
-            $networks = Network::whereIn('name', $visibleSbus)->get();
+            $visibleSiteIds = site::query()
+                ->whereIn(DB::raw("UPPER(REPLACE(sbu, ' ', ''))"), $visibleSbus)
+                ->pluck('id');
+
+            $networkIds = site::whereIn('id', $visibleSiteIds->isNotEmpty() ? $visibleSiteIds : [-1])
+                ->pluck('network_id')
+                ->filter()
+                ->unique()
+                ->values();
+
+            $networks = Network::whereIn('id', $networkIds->isNotEmpty() ? $networkIds : [-1])->get();
         } else {
             $networks = Network::all();
         }
@@ -715,8 +1194,68 @@ class ReportsController extends Controller
             if ($isSupervisor && !empty($authorizedClerkIds)) {
                 $query->whereIn('user_id', $authorizedClerkIds);
             }
+
+            if ($isSupervisor && $visibleSiteIds->isNotEmpty()) {
+                $query->whereIn('siteid', $visibleSiteIds);
+            }
             
             $sql = $query->get();
+
+            $usdcompiledFigures[] = [
+                'networkname' => $network->name,
+                'insurance_transactions' => $sql->sum('insurance_transactions'),
+                'zinara_transactions' => $sql->sum('zinara_fees'),
+                'third_party_premiums' => $sql->sum('third_party_premiums'),
+                'full_cover_premiums' => $sql->sum('full_cover_premiums'),
+                'usd_total_deposited' => $sql->sum('usd_total_deposited'),
+                'usd_cash' => $sql->sum('usd_cash'),
+                'usd_swipe' => $sql->sum('usd_swipe'),
+                'usd_transfers' => $sql->sum('usd_transfers'),
+                'usd_debit_sales' => $sql->sum('usd_debit_sales'),
+                'usd_credit_sales' => $sql->sum('usd_credit_sales'),
+            ];
+
+            $zwgcompiledFigures[] = [
+                'networkname' => $network->name,
+                'zwg_insurance_transactions' => $sql->sum('zwg_insurance_transactions'),
+                'zwg_zinara_fees' => $sql->sum('zwg_zinara_fees'),
+                'zwg_third_party_premiums' => $sql->sum('zwg_third_party_premiums'),
+                'zwg_full_cover_premiums' => $sql->sum('zwg_full_cover_premiums'),
+                'zwg_total_deposited' => $sql->sum('zwg_total_deposited'),
+                'zwg_cash' => $sql->sum('zwg_cash'),
+                'zwg_swipe' => $sql->sum('zwg_swipe'),
+                'zwg_transfers' => $sql->sum('zwg_transfers'),
+                'zwg_debit_sales' => $sql->sum('zwg_debit_sales'),
+                'zwg_credit_sales' => $sql->sum('zwg_credit_sales'),
+            ];
+        }
+
+        return view('Reports.cumulativenetwork', compact('networks', 'usdcompiledFigures', 'zwgcompiledFigures', 'startdate', 'enddate', 'userSBU'));
+    }
+
+    private function courierSupervisorCumulativeNetworkReport(Request $request)
+    {
+        $userSBU = self::COURIER_PLATFORM;
+        $startdate = $request->startdate ?: Carbon::now()->startOfMonth()->toDateString();
+        $enddate = $request->enddate ?: Carbon::now()->toDateString();
+        $visibleSiteIds = $this->getCourierSupervisorSiteIds();
+        $clerkIds = $this->getCourierSupervisorAuthorizedClerkIds();
+
+        $networkIds = site::whereIn('id', $visibleSiteIds->isNotEmpty() ? $visibleSiteIds : [-1])
+            ->pluck('network_id')
+            ->filter()
+            ->unique()
+            ->values();
+
+        $networks = Network::whereIn('id', $networkIds->isNotEmpty() ? $networkIds : [-1])->get();
+        $usdcompiledFigures = [];
+        $zwgcompiledFigures = [];
+
+        foreach ($networks as $network) {
+            $sql = DailyCollection::where('networkid', $network->id)
+                ->whereBetween('created_at', [$startdate, $enddate])
+                ->whereIn('user_id', !empty($clerkIds) ? $clerkIds : [-1])
+                ->get();
 
             $usdcompiledFigures[] = [
                 'networkname' => $network->name,

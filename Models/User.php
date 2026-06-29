@@ -26,6 +26,8 @@ class User extends Authenticatable
         'role_id',
         'siteid',
         'networkid', 
+        'zinara_credential',
+        'icecash_credential',
     ];
 
     public function site()
@@ -35,6 +37,16 @@ class User extends Authenticatable
 public function network()
 {
     return $this->belongsTo(Network::class, 'networkid');
+}
+
+public function office()
+{
+    return $this->site();
+}
+
+public function region()
+{
+    return $this->network();
 }
 
 public function role()

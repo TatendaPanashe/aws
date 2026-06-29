@@ -46,6 +46,7 @@ class DailyCollection extends Model
         'POS',
         'code',
         'site_name',
+        'transaction_date',
         'zwg_debit_sales',
         'usd_debit_sales',
         'zwg_credit_sales',
@@ -57,11 +58,14 @@ class DailyCollection extends Model
         'other_insurances_zwg',
         'other_insurances_usd',
         'platform_name',
+        'zinara_credential',
+        'icecash_credential',
     ];
 
     protected $casts = [
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
+        'transaction_date' => 'date',
         'insurance_transactions' => 'decimal:2',
         'zwg_insurance_transactions' => 'decimal:2',
         'usd_cash' => 'decimal:2',
@@ -72,7 +76,7 @@ class DailyCollection extends Model
 
     public function site()
     {
-        return $this->belongsTo(Site::class, 'siteid');
+        return $this->belongsTo(site::class, 'siteid');
     }
     public function platform()
     {

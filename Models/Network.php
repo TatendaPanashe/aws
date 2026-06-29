@@ -25,8 +25,18 @@ class Network extends Model
     {
         return $this->belongsTo(User::class);
     }
-     public function budgets()
+    public function budgets()
     {
         return $this->hasMany(Budget::class);
+    }
+
+    public function offices()
+    {
+        return $this->hasMany(site::class, 'network_id');
+    }
+
+    public function sites()
+    {
+        return $this->offices();
     }
 }
